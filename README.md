@@ -245,6 +245,10 @@ This template defines how messages are formatted with the `<|im_start|>` / `<|im
 
 After this step, `models/ox-zesty-white-chipmunk-merged/` contains a full HuggingFace model that could be loaded with `transformers` directly -- no `peft` required.
 
+### A note on Gemma 4 models
+
+Gemma 4 uses a custom layer type (`Gemma4ClippableLinear`) in its vision and audio encoders that PEFT doesn't recognise as a supported module. The merge script detects Gemma 4 models automatically (by checking for `gemma-4` in the HuggingFace model name) and routes to `scripts/merge_gemma_lora.py`, which monkey-patches the layer to inherit from `nn.Linear` before loading. No extra flags are needed -- just run `merge_lora.py` as usual and it will do the right thing. See [huggingface/peft#3129](https://github.com/huggingface/peft/issues/3129) for upstream status, and `scripts/merge_gemma_lora.py` for the full workaround.
+
 ---
 
 ## Step 3: Convert to GGUF
@@ -461,13 +465,15 @@ If you've already done some steps and want to skip ahead:
 
 **"ollama is not installed"** -- Install with `brew install ollama` on macOS or grab it from [ollama.com](https://ollama.com).
 
-**Model generates garbage or doesn't stop** -- The chat template probably doesn't match what the model was trained on. Double-check that the `TEMPLATE` in your Modelfile uses the right special tokens for your base model architecture.
+**Model generates garbage or doesn't stop** -- The chat template probably doesn't match what the model was trained on. Double-check that the `TEMPLATE` in your Modelfile uses the right special tokens for your base model architecture. Qwen models use ChatML (`<|im_start|>`/`<|im_end|>`), while Gemma 4 uses turn tokens (`<|turn>`/`<turn|>`). The `generate_modelfile.py` script auto-detects the format when you pass `--base-model`, and `convert_to_ollama.sh` resolves it from the adapter config automatically.
 
 **Out of memory during merge** -- The merge step loads the full base model into memory. For larger models (7B+), you may need 16-32GB of RAM. The script uses `device_map="cpu"` and `bfloat16` precision to keep memory usage reasonable.
 
 **torch version conflicts** -- If you see errors about torch version mismatches after the llama.cpp setup, it's likely because llama.cpp's dependencies tried to pin a different torch version. The script avoids this by installing `gguf` with `--no-deps`, but if you ran `pip install -r requirements.txt` manually from the llama.cpp repo, your torch may have been downgraded. Reinstall with `pip install torch transformers peft accelerate`.
 
 **Quantization quality** -- If tool calls are coming back malformed or the model seems confused, try a higher quantization level like Q6_K or Q8_0. Lower bit quantization can sometimes degrade structured output quality, especially for smaller models.
+
+**Gemma 4 "Target module Gemma4ClippableLinear is not supported"** -- This is a known PEFT incompatibility. `merge_lora.py` handles it automatically for any model with `gemma-4` in the name by delegating to `scripts/merge_gemma_lora.py`. If you hit this error, make sure you're running `merge_lora.py` (or `convert_to_ollama.sh`) rather than calling PEFT directly.
 
 ---
 

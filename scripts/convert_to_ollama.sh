@@ -102,12 +102,25 @@ GGUF_BF16="${MERGED_PATH}/model-bf16.gguf"
 GGUF_QUANTIZED="${MERGED_PATH}/model-${QUANT_TYPE}.gguf"
 MODELFILE="${MERGED_PATH}/Modelfile"
 
+# Resolve the base model from adapter_config.json if not explicitly provided.
+# This is needed both for the merge step and for generating the correct Modelfile
+# (Gemma 4 and Qwen use different chat templates and stop tokens).
+if [ -z "$BASE_MODEL" ]; then
+    ADAPTER_CONFIG="${ADAPTER_PATH}/adapter_config.json"
+    if [ -f "$ADAPTER_CONFIG" ]; then
+        RAW_BASE=$(python3 -c "import json; print(json.load(open('${ADAPTER_CONFIG}'))['base_model_name_or_path'])")
+        BASE_MODEL=$(echo "$RAW_BASE" | sed 's/_local$//' | sed 's/_/\//')
+        echo "Auto-detected base model: ${BASE_MODEL}"
+    fi
+fi
+
 echo "============================================"
 echo "  LoRA -> GGUF -> Ollama Conversion Pipeline"
 echo "============================================"
 echo ""
 echo "  Adapter path:   ${ADAPTER_PATH}"
 echo "  Merged path:    ${MERGED_PATH}"
+echo "  Base model:     ${BASE_MODEL:-auto-detect}"
 echo "  Quantization:   ${QUANT_TYPE}"
 echo "  Ollama name:    ${OLLAMA_NAME}"
 echo "  Tools:          ${TOOLS_PATH:-none}"
@@ -196,6 +209,9 @@ MODELFILE_ARGS=(
     --gguf-path "./model-${QUANT_TYPE}.gguf"
     --output "$MODELFILE"
 )
+if [ -n "$BASE_MODEL" ]; then
+    MODELFILE_ARGS+=(--base-model "$BASE_MODEL")
+fi
 if [ -n "$TOOLS_PATH" ]; then
     MODELFILE_ARGS+=(--tools-path "$TOOLS_PATH")
 fi
