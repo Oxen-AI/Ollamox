@@ -1,5 +1,8 @@
 """
-Merge a LoRA adapter into the base Qwen3.5 model and save the merged weights.
+Merge a LoRA adapter into the base model and save the merged weights.
+
+For Gemma 4 models, automatically delegates to merge_gemma_lora which
+monkey-patches Gemma4ClippableLinear so PEFT can handle the merge.
 
 Usage:
     python scripts/merge_lora.py \
@@ -16,6 +19,24 @@ from pathlib import Path
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def _resolve_base_model(adapter_path: Path, explicit_base: str | None) -> str:
+    if explicit_base:
+        return explicit_base
+    config_path = adapter_path / "adapter_config.json"
+    with open(config_path) as f:
+        config = json.load(f)
+    raw = config["base_model_name_or_path"]
+    # The training script saved the path with underscores instead of slashes.
+    # Convert "Qwen_Qwen3.5-0.8B_local" -> "Qwen/Qwen3.5-0.8B"
+    base_model_id = raw.replace("_local", "").replace("_", "/", 1)
+    print(f"Inferred base model from adapter config: {base_model_id}")
+    return base_model_id
+
+
+def _is_gemma4(base_model_id: str) -> bool:
+    return "gemma-4" in base_model_id.lower()
 
 
 def main():
@@ -43,19 +64,14 @@ def main():
 
     adapter_path = Path(args.adapter_path)
     output_path = Path(args.output_path)
+    base_model_id = _resolve_base_model(adapter_path, args.base_model)
 
-    # Determine the base model
-    if args.base_model:
-        base_model_id = args.base_model
-    else:
-        config_path = adapter_path / "adapter_config.json"
-        with open(config_path) as f:
-            config = json.load(f)
-        raw = config["base_model_name_or_path"]
-        # The training script saved the path with underscores instead of slashes.
-        # Convert "Qwen_Qwen3.5-0.8B_local" -> "Qwen/Qwen3.5-0.8B"
-        base_model_id = raw.replace("_local", "").replace("_", "/", 1)
-        print(f"Inferred base model from adapter config: {base_model_id}")
+    if _is_gemma4(base_model_id):
+        from merge_gemma_lora import merge_gemma_lora
+
+        print(f"Detected Gemma 4 model — using Gemma-specific merge path")
+        merge_gemma_lora(adapter_path, output_path, base_model_id)
+        return
 
     print(f"Loading base model: {base_model_id}")
     base_model = AutoModelForCausalLM.from_pretrained(
@@ -66,7 +82,6 @@ def main():
     )
 
     print(f"Loading LoRA adapter from: {adapter_path}")
-    # Patch the adapter config so PEFT can find the base model
     config_path = adapter_path / "adapter_config.json"
     with open(config_path) as f:
         config = json.load(f)
