@@ -2,7 +2,7 @@
 Merge a LoRA adapter into the base model and save the merged weights.
 
 For Gemma 4 models, automatically delegates to merge_gemma_lora which
-monkey-patches Gemma4ClippableLinear so PEFT can handle the merge.
+remaps adapter keys and uses the text-only Gemma4ForCausalLM for merging.
 
 Usage:
     python scripts/merge_lora.py \

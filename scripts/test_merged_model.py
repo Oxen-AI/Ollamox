@@ -213,7 +213,7 @@ def main():
             base_model_id = cfg.get("_name_or_path", "")
             print(f"Base model from merged config: {base_model_id}")
 
-    from transformers import AutoModelForImageTextToText, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
     # =========================================================
     # Stage A: adapter path provided → full 3-stage diagnosis
@@ -222,10 +222,26 @@ def main():
         adapter_path = Path(args.adapter_path)
         _patch_gemma4_clippable_linear()
 
+        # Check if adapter uses conditional-model naming (language_model prefix)
+        needs_remap = False
+        try:
+            from safetensors import safe_open
+            sf_path = adapter_path / "adapter_model.safetensors"
+            if sf_path.exists():
+                with safe_open(str(sf_path), framework="pt") as f:
+                    needs_remap = any("language_model" in k for k in f.keys())
+        except Exception:
+            pass
+
+        if needs_remap:
+            print("Adapter uses Gemma4ForConditionalGeneration naming — "
+                  "will remap keys and use text-only Gemma4ForCausalLM")
+
         # --- A1: Base model alone ---
         if not args.skip_base and base_model_id:
             print("\n>>> STAGE 1: Base model (no adapter)")
-            base_model = AutoModelForImageTextToText.from_pretrained(
+            loader_cls = AutoModelForCausalLM if needs_remap else AutoModelForImageTextToText
+            base_model = loader_cls.from_pretrained(
                 base_model_id,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
@@ -254,7 +270,8 @@ def main():
         print("\n>>> STAGE 2: PeftModel (adapter loaded, NOT merged)")
         from peft import PeftModel
 
-        peft_base = AutoModelForImageTextToText.from_pretrained(
+        loader_cls = AutoModelForCausalLM if needs_remap else AutoModelForImageTextToText
+        peft_base = loader_cls.from_pretrained(
             base_model_id,
             torch_dtype=torch.bfloat16,
             device_map="auto",
@@ -263,8 +280,33 @@ def main():
         )
         tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
 
+        # If we need remapping, create a temp adapter with remapped keys
+        effective_adapter_path = str(adapter_path)
+        tmp_remap_dir = None
+        if needs_remap:
+            import tempfile
+            from safetensors import safe_open
+            from safetensors.torch import save_file
+
+            print("  Remapping adapter keys: model.language_model.* -> model.*")
+            with safe_open(str(adapter_path / "adapter_model.safetensors"), framework="pt") as f:
+                weights = {k: f.get_tensor(k) for k in f.keys()}
+            remapped = {}
+            for k, v in weights.items():
+                if "audio_tower" in k or "vision_tower" in k:
+                    continue
+                remapped[k.replace(".model.language_model.", ".model.")] = v
+            print(f"  {len(weights)} -> {len(remapped)} keys (dropped {len(weights)-len(remapped)} vision/audio)")
+
+            tmp_remap_dir = tempfile.mkdtemp(prefix="gemma4_remap_test_")
+            save_file(remapped, str(Path(tmp_remap_dir) / "adapter_model.safetensors"))
+            cfg = json.load(open(adapter_path / "adapter_config.json"))
+            cfg["base_model_name_or_path"] = base_model_id
+            json.dump(cfg, open(Path(tmp_remap_dir) / "adapter_config.json", "w"), indent=2)
+            effective_adapter_path = tmp_remap_dir
+
         peft_model = PeftModel.from_pretrained(
-            peft_base, str(adapter_path),
+            peft_base, effective_adapter_path,
             torch_dtype=torch.bfloat16,
         )
         peft_model.eval()
@@ -296,18 +338,32 @@ def main():
         del merged_model
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
+        if tmp_remap_dir:
+            import shutil
+            shutil.rmtree(tmp_remap_dir, ignore_errors=True)
+
     # =========================================================
     # Stage B: just test an already-saved merged model
     # =========================================================
     if args.merged_path:
         print("\n>>> Testing saved merged model from disk")
-        merged_model = AutoModelForImageTextToText.from_pretrained(
-            args.merged_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-        )
+        # Try CausalLM first (text-only merge output), fall back to multimodal
+        try:
+            merged_model = AutoModelForCausalLM.from_pretrained(
+                args.merged_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+            )
+        except Exception:
+            merged_model = AutoModelForImageTextToText.from_pretrained(
+                args.merged_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+            )
         tokenizer = AutoTokenizer.from_pretrained(args.merged_path, trust_remote_code=True)
         print(f"  Model class: {type(merged_model).__name__}")
 

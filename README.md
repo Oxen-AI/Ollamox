@@ -249,7 +249,7 @@ After this step, `models/ox-zesty-white-chipmunk-merged/` contains a full Huggin
 
 ### A note on Gemma 4 models
 
-Gemma 4 is a multimodal model (`Gemma4ForConditionalGeneration`) that must be loaded with `AutoModelForImageTextToText` -- not `AutoModelForCausalLM`. Using the wrong loader class loads a text-only model where the module paths don't include the `language_model.` prefix that the LoRA adapter expects, causing the adapter weights to silently fail to apply. The merge script detects Gemma 4 models automatically (by checking for `gemma-4` in the HuggingFace model name) and routes to `scripts/merge_gemma_lora.py`, which uses the correct loader and monkey-patches `Gemma4ClippableLinear` (a custom layer in the vision/audio encoders that PEFT doesn't support yet). No extra flags are needed -- just run `merge_lora.py` as usual and it will do the right thing. See [huggingface/peft#3129](https://github.com/huggingface/peft/issues/3129) for upstream status, and `scripts/merge_gemma_lora.py` for the full workaround.
+Gemma 4 adapters are typically trained against the multimodal wrapper (`Gemma4ForConditionalGeneration`), which nests the text decoder under `model.language_model.*`. The text-only model (`Gemma4ForCausalLM`) exposes the same layers under `model.*`. Loading the full multimodal model for merging brings in vision/audio towers with `Gemma4ClippableLinear` layers that PEFT doesn't support natively. Instead, `scripts/merge_gemma_lora.py` loads the text-only `Gemma4ForCausalLM` and remaps the adapter keys -- stripping the `language_model.` prefix so they line up with the text-only module paths. Vision/audio tower adapter keys are dropped (they carry no trained weights for text-only fine-tunes). This approach follows the same pattern as [vllm-project/vllm#38844](https://github.com/vllm-project/vllm/pull/38844). The merge script detects Gemma 4 models automatically (by checking for `gemma-4` in the model name) -- no extra flags needed. See [huggingface/peft#3129](https://github.com/huggingface/peft/issues/3129) for upstream status.
 
 ---
 
@@ -475,7 +475,7 @@ If you've already done some steps and want to skip ahead:
 
 **Quantization quality** -- If tool calls are coming back malformed or the model seems confused, try a higher quantization level like Q6_K or Q8_0. Lower bit quantization can sometimes degrade structured output quality, especially for smaller models.
 
-**Gemma 4 "Target module Gemma4ClippableLinear is not supported"** -- This is a known PEFT incompatibility. `merge_lora.py` handles it automatically for any model with `gemma-4` in the name by delegating to `scripts/merge_gemma_lora.py`. If you hit this error, make sure you're running `merge_lora.py` (or `convert_to_ollama.sh`) rather than calling PEFT directly.
+**Gemma 4 "Target module Gemma4ClippableLinear is not supported"** -- This is a known PEFT incompatibility with Gemma 4's vision/audio encoders. `merge_lora.py` handles it automatically for any model with `gemma-4` in the name by delegating to `scripts/merge_gemma_lora.py`, which loads the text-only `Gemma4ForCausalLM` (no vision/audio towers) and remaps adapter keys. If you hit this error, make sure you're running `merge_lora.py` (or `convert_to_ollama.sh`) rather than calling PEFT directly.
 
 ---
 
