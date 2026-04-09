@@ -1,16 +1,18 @@
 # From Fine-Tuned LoRA Weights to a Local Ollama Model
 
-Fine-tuning open source models puts the power back in your hands. This repository has code to take fine-tuned LoRA weights and import them into Ollama so you can run a fine-tuned model locally on your machine. Running it locally means your data stays on your machine, there are no API costs, and it works offline. You can optimize for accuracy and privacy with full control over the model weights.
+Open weights models have many advantages over closed APIs. You can run them on your own hardware, fine-tune them on your own data, and ship them without depending on someone else's infrastructure. 
+
+Oxen.ai makes it easy to [fine-tune open weight models](https://docs.oxen.ai/getting-started/fine-tuning) on your own data, with a single click. It versions your data + model weights + configuration together so you can always reproduce your experiments. Once you have these weights, how do you get them to run locally? That's where this tutorial comes in. We'll walk through how to merge LoRA weights into a base model, then load the result directly into Ollama for local inference.
 
 ## 🦙 What is Ollama?
 
-Ollama is a nice tool for running models locally, but getting your fine-tuned LoRA weights into a format it understands takes a few steps. This guide walks through the full pipeline: downloading your weights from Oxen.ai, merging them into a base model, converting to GGUF, quantizing, and importing into Ollama. If you don't understand what any of that jargon means, don't worry! We'll walk you through step by step.
+[Ollama](https://ollama.com) is a nice tool for running models locally, but getting your fine-tuned LoRA weights into a format it understands takes a few steps. This guide walks through the full pipeline: downloading your weights from Oxen.ai, merging them into a base model, converting to GGUF, quantizing, and importing into Ollama. If you don't understand what any of that jargon means, don't worry! We'll walk you through step by step.
 
 In this post we will use use a Qwen3.5 fine-tune as our running example, but the process applies generally to any HuggingFace compatible base model.
 
 ## Just Give Me the Command
 
-If you don't care about what's happening under the hood and just want your model running in Ollama, download your weights and run the conversion script. This assumes you have already [fine-tuned a model in Oxen.ai](TODO)
+If you don't care about what's happening under the hood and just want your model running in Ollama, download your weights and run the conversion script. This assumes you have already [fine-tuned a model in Oxen.ai](https://docs.oxen.ai/examples/fine-tuning/chat_completions).
 
 ```bash
 # Download your LoRA adapter weights from Oxen.ai
@@ -247,7 +249,7 @@ After this step, `models/ox-zesty-white-chipmunk-merged/` contains a full Huggin
 
 ### A note on Gemma 4 models
 
-Gemma 4 uses a custom layer type (`Gemma4ClippableLinear`) in its vision and audio encoders that PEFT doesn't recognise as a supported module. The merge script detects Gemma 4 models automatically (by checking for `gemma-4` in the HuggingFace model name) and routes to `scripts/merge_gemma_lora.py`, which monkey-patches the layer to inherit from `nn.Linear` before loading. No extra flags are needed -- just run `merge_lora.py` as usual and it will do the right thing. See [huggingface/peft#3129](https://github.com/huggingface/peft/issues/3129) for upstream status, and `scripts/merge_gemma_lora.py` for the full workaround.
+Gemma 4 is a multimodal model (`Gemma4ForConditionalGeneration`) that must be loaded with `AutoModelForImageTextToText` -- not `AutoModelForCausalLM`. Using the wrong loader class loads a text-only model where the module paths don't include the `language_model.` prefix that the LoRA adapter expects, causing the adapter weights to silently fail to apply. The merge script detects Gemma 4 models automatically (by checking for `gemma-4` in the HuggingFace model name) and routes to `scripts/merge_gemma_lora.py`, which uses the correct loader and monkey-patches `Gemma4ClippableLinear` (a custom layer in the vision/audio encoders that PEFT doesn't support yet). No extra flags are needed -- just run `merge_lora.py` as usual and it will do the right thing. See [huggingface/peft#3129](https://github.com/huggingface/peft/issues/3129) for upstream status, and `scripts/merge_gemma_lora.py` for the full workaround.
 
 ---
 

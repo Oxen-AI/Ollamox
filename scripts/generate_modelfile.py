@@ -255,8 +255,10 @@ def main():
     system_block = None
     if tools or system_prompt:
         system_block = build_system_block(system_prompt, tools, gemma4=gemma4)
+    print(f"System block: {system_block}")
 
     modelfile = build_modelfile(args.gguf_path, system_block, gemma4=gemma4)
+    print(f"Modelfile: {modelfile}")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
