@@ -263,9 +263,47 @@ def merge_gemma_lora(adapter_path: Path, output_path: Path, base_model_id: str):
                     print("    OK — merge changed the weights")
                 break
 
+    # Quick smoke-test: generate a short completion with the merged model
+    # to verify the fine-tune is present BEFORE saving/GGUF conversion.
+    print("Running quick inference smoke-test on merged model...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Hello"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            output_ids = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+        response = tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        print(f"  Prompt: Hello")
+        print(f"  Response: {response[:200]}")
+    except Exception as e:
+        print(f"  Smoke-test skipped: {e}")
+
+    # Also dump the saved weight keys so we can compare with what the
+    # GGUF converter will read.
     print(f"Saving merged model to: {output_path}")
     output_path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(output_path, safe_serialization=True, max_shard_size="2GB")
+
+    # Verify what was actually written to disk
+    try:
+        from safetensors import safe_open
+        saved_files = sorted(output_path.glob("*.safetensors"))
+        total_keys = 0
+        sample_keys = []
+        for sf in saved_files:
+            with safe_open(str(sf), framework="pt") as f:
+                keys = f.keys()
+                total_keys += len(keys)
+                if not sample_keys:
+                    sample_keys = sorted(keys)[:3]
+        print(f"  Saved {total_keys} weight keys across {len(saved_files)} shard(s)")
+        print(f"  Sample saved keys: {sample_keys}")
+    except Exception:
+        pass
 
     # Try the adapter's tokenizer first (it may have been updated during
     # training, e.g. new special tokens). Fall back to base model if it fails.
