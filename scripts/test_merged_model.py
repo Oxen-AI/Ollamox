@@ -5,20 +5,17 @@ Diagnose LoRA merge issues by testing at every stage of the pipeline:
   2. Base + adapter as PeftModel (adapter applied but NOT merged)
   3. After merge_and_unload() (adapter merged into weights)
 
-This isolates whether the problem is in the adapter itself, the merge
-step, or something downstream. Also prints detailed LoRA weight stats.
+This isolates whether the problem is in the adapter, the merge step, or
+something downstream.
 
 Usage:
-    # Full 3-stage test (needs base model + adapter)
-    python scripts/test_merged_model.py \
-        --adapter-path models/ox-monetary-lavender-finch \
+    python scripts/test_merged_model.py \\
+        --adapter-path models/ox-monetary-lavender-finch \\
         --prompt "Hi"
 
-    # Just test an already-merged model
-    python scripts/test_merged_model.py \
-        --merged-path models/ox-monetary-lavender-finch-merged \
-        --prompt "Hi" \
-        --skip-base
+    python scripts/test_merged_model.py \\
+        --merged-path models/ox-monetary-lavender-finch-merged \\
+        --prompt "Hi" --skip-base
 """
 
 import argparse
@@ -30,7 +27,7 @@ import torch.nn as nn
 
 
 def _patch_gemma4_clippable_linear():
-    """Same monkey-patch as merge_gemma_lora.py so we can load the adapter."""
+    """Same monkey-patch as merge_gemma_lora.py."""
     try:
         from transformers.models.gemma4 import modeling_gemma4
     except ImportError:
@@ -108,7 +105,6 @@ def inspect_lora_weights(model):
                 trained_modules += 1
             rows.append((name, A.shape, B.shape, a_norm, b_norm, ba_norm, is_trained))
 
-    # Print summary table — show all untrained and first/last few trained
     lang_trained = [r for r in rows if r[6] and "language_model" in r[0]]
     lang_untrained = [r for r in rows if not r[6] and "language_model" in r[0]]
     other_trained = [r for r in rows if r[6] and "language_model" not in r[0]]
@@ -136,14 +132,15 @@ def inspect_lora_weights(model):
             short = name.replace("base_model.model.", "")
             tag = "TRAINED" if trained else "ZERO-B"
             print(f"    {short}")
-            print(f"      A{list(a_shape)} norm={a_norm:.4f}  B{list(b_shape)} norm={b_norm:.6f}  BA norm={ba_norm:.6f}  [{tag}]")
+            print(f"      A{list(a_shape)} norm={a_norm:.4f}  "
+                  f"B{list(b_shape)} norm={b_norm:.6f}  "
+                  f"BA norm={ba_norm:.6f}  [{tag}]")
 
     _print_rows("Language model — trained", lang_trained, 5)
     _print_rows("Language model — UNTRAINED (zero B)", lang_untrained, 3)
     _print_rows("Vision/audio — trained", other_trained, 3)
     _print_rows("Vision/audio — UNTRAINED (zero B)", other_untrained, 3)
 
-    # Aggregate BA norms for trained language model modules
     if lang_trained:
         ba_norms = [r[5] for r in lang_trained]
         print(f"\n  Language model BA norm stats (trained only):")
@@ -166,29 +163,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Diagnose LoRA merge at every stage (base / PeftModel / merged)"
     )
-    parser.add_argument(
-        "--adapter-path", type=str, default=None,
-        help="Path to the LoRA adapter directory (runs full 3-stage test)",
-    )
-    parser.add_argument(
-        "--merged-path", type=str, default=None,
-        help="Path to an already-merged model (skips adapter stages)",
-    )
-    parser.add_argument(
-        "--base-model", type=str, default=None,
-        help="HuggingFace base model ID. Auto-detected from adapter/merged config if omitted.",
-    )
-    parser.add_argument(
-        "--prompt", type=str, action="append", default=None,
-        help="Prompt(s) to test (repeatable). Defaults to ['Hello'].",
-    )
-    parser.add_argument(
-        "--max-new-tokens", type=int, default=128,
-    )
-    parser.add_argument(
-        "--skip-base", action="store_true",
-        help="Skip the base-model-only test (saves memory/time)",
-    )
+    parser.add_argument("--adapter-path", type=str, default=None)
+    parser.add_argument("--merged-path", type=str, default=None)
+    parser.add_argument("--base-model", type=str, default=None)
+    parser.add_argument("--prompt", type=str, action="append", default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--skip-base", action="store_true")
     args = parser.parse_args()
 
     if not args.adapter_path and not args.merged_path:
@@ -196,52 +176,34 @@ def main():
 
     prompts = args.prompt or ["Hello"]
 
-    # --- Resolve base model ID ---
+    # Resolve base model ID
     base_model_id = args.base_model
     if base_model_id is None and args.adapter_path:
         cfg_path = Path(args.adapter_path) / "adapter_config.json"
         if cfg_path.exists():
             with open(cfg_path) as f:
-                cfg = json.load(f)
-            base_model_id = cfg.get("base_model_name_or_path", "")
+                base_model_id = json.load(f).get("base_model_name_or_path", "")
             print(f"Base model from adapter config: {base_model_id}")
     if base_model_id is None and args.merged_path:
         cfg_path = Path(args.merged_path) / "config.json"
         if cfg_path.exists():
             with open(cfg_path) as f:
-                cfg = json.load(f)
-            base_model_id = cfg.get("_name_or_path", "")
+                base_model_id = json.load(f).get("_name_or_path", "")
             print(f"Base model from merged config: {base_model_id}")
 
-    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
     # =========================================================
-    # Stage A: adapter path provided → full 3-stage diagnosis
+    # Stage A: adapter path → full 3-stage diagnosis
     # =========================================================
     if args.adapter_path:
         adapter_path = Path(args.adapter_path)
         _patch_gemma4_clippable_linear()
 
-        # Check if adapter uses conditional-model naming (language_model prefix)
-        needs_remap = False
-        try:
-            from safetensors import safe_open
-            sf_path = adapter_path / "adapter_model.safetensors"
-            if sf_path.exists():
-                with safe_open(str(sf_path), framework="pt") as f:
-                    needs_remap = any("language_model" in k for k in f.keys())
-        except Exception:
-            pass
-
-        if needs_remap:
-            print("Adapter uses Gemma4ForConditionalGeneration naming — "
-                  "will remap keys and use text-only Gemma4ForCausalLM")
-
         # --- A1: Base model alone ---
         if not args.skip_base and base_model_id:
             print("\n>>> STAGE 1: Base model (no adapter)")
-            loader_cls = AutoModelForCausalLM if needs_remap else AutoModelForImageTextToText
-            base_model = loader_cls.from_pretrained(
+            base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_id,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
@@ -253,7 +215,6 @@ def main():
 
             test_stage("BASE MODEL (no adapter)", base_model, tokenizer, prompts, args.max_new_tokens)
 
-            # Snapshot a weight for later comparison
             base_snapshot = {}
             for name, param in base_model.named_parameters():
                 if "self_attn.q_proj.weight" in name and "vision" not in name and "audio" not in name:
@@ -270,8 +231,7 @@ def main():
         print("\n>>> STAGE 2: PeftModel (adapter loaded, NOT merged)")
         from peft import PeftModel
 
-        loader_cls = AutoModelForCausalLM if needs_remap else AutoModelForImageTextToText
-        peft_base = loader_cls.from_pretrained(
+        peft_base = AutoModelForCausalLM.from_pretrained(
             base_model_id,
             torch_dtype=torch.bfloat16,
             device_map="auto",
@@ -280,33 +240,17 @@ def main():
         )
         tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
 
-        # If we need remapping, create a temp adapter with remapped keys
-        effective_adapter_path = str(adapter_path)
-        tmp_remap_dir = None
-        if needs_remap:
-            import tempfile
-            from safetensors import safe_open
-            from safetensors.torch import save_file
-
-            print("  Remapping adapter keys: model.language_model.* -> model.*")
-            with safe_open(str(adapter_path / "adapter_model.safetensors"), framework="pt") as f:
-                weights = {k: f.get_tensor(k) for k in f.keys()}
-            remapped = {}
-            for k, v in weights.items():
-                if "audio_tower" in k or "vision_tower" in k:
-                    continue
-                remapped[k.replace(".model.language_model.", ".model.")] = v
-            print(f"  {len(weights)} -> {len(remapped)} keys (dropped {len(weights)-len(remapped)} vision/audio)")
-
-            tmp_remap_dir = tempfile.mkdtemp(prefix="gemma4_remap_test_")
-            save_file(remapped, str(Path(tmp_remap_dir) / "adapter_model.safetensors"))
-            cfg = json.load(open(adapter_path / "adapter_config.json"))
-            cfg["base_model_name_or_path"] = base_model_id
-            json.dump(cfg, open(Path(tmp_remap_dir) / "adapter_config.json", "w"), indent=2)
-            effective_adapter_path = tmp_remap_dir
+        # Update adapter config to match the base model we're actually loading
+        adapter_cfg_path = adapter_path / "adapter_config.json"
+        with open(adapter_cfg_path) as f:
+            adapter_cfg = json.load(f)
+        if adapter_cfg.get("base_model_name_or_path") != base_model_id:
+            adapter_cfg["base_model_name_or_path"] = base_model_id
+            with open(adapter_cfg_path, "w") as f:
+                json.dump(adapter_cfg, f, indent=2)
 
         peft_model = PeftModel.from_pretrained(
-            peft_base, effective_adapter_path,
+            peft_base, str(adapter_path),
             torch_dtype=torch.bfloat16,
         )
         peft_model.eval()
@@ -315,13 +259,13 @@ def main():
 
         inspect_lora_weights(peft_model)
 
-        test_stage("PEFT MODEL (adapter loaded, NOT merged)", peft_model, tokenizer, prompts, args.max_new_tokens)
+        test_stage("PEFT MODEL (adapter loaded, NOT merged)",
+                   peft_model, tokenizer, prompts, args.max_new_tokens)
 
         # --- A3: Merge and test ---
         print("\n>>> STAGE 3: After merge_and_unload()")
         merged_model = peft_model.merge_and_unload()
 
-        # Compare weights with base snapshot
         if base_snapshot:
             print("\n--- Weight diff (merged vs base) ---")
             for name, param in merged_model.named_parameters():
@@ -333,41 +277,30 @@ def main():
                     print(f"  {name}")
                     print(f"    base_norm={base_norm:.4f}  delta_norm={delta_norm:.6f}  ({pct:.4f}%)")
 
-        test_stage("MERGED MODEL (after merge_and_unload)", merged_model, tokenizer, prompts, args.max_new_tokens)
+        test_stage("MERGED MODEL (after merge_and_unload)",
+                   merged_model, tokenizer, prompts, args.max_new_tokens)
 
         del merged_model
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-        if tmp_remap_dir:
-            import shutil
-            shutil.rmtree(tmp_remap_dir, ignore_errors=True)
 
     # =========================================================
     # Stage B: just test an already-saved merged model
     # =========================================================
     if args.merged_path:
+        _patch_gemma4_clippable_linear()
         print("\n>>> Testing saved merged model from disk")
-        # Try CausalLM first (text-only merge output), fall back to multimodal
-        try:
-            merged_model = AutoModelForCausalLM.from_pretrained(
-                args.merged_path,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
-            )
-        except Exception:
-            merged_model = AutoModelForImageTextToText.from_pretrained(
-                args.merged_path,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
-            )
+        merged_model = AutoModelForCausalLM.from_pretrained(
+            args.merged_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        )
         tokenizer = AutoTokenizer.from_pretrained(args.merged_path, trust_remote_code=True)
         print(f"  Model class: {type(merged_model).__name__}")
 
-        test_stage("SAVED MERGED MODEL (from disk)", merged_model, tokenizer, prompts, args.max_new_tokens)
+        test_stage("SAVED MERGED MODEL (from disk)",
+                   merged_model, tokenizer, prompts, args.max_new_tokens)
 
     print("\n=== All tests complete ===")
 
