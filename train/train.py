@@ -24,11 +24,13 @@ Usage:
 
 import argparse
 import gc
+import json
 import os
 from pathlib import Path
 import torch
 from datasets import load_dataset
-from peft import LoraConfig, PeftModel
+from peft import LoraConfig, PeftModel, get_peft_model, set_peft_model_state_dict
+from safetensors.torch import load_file as load_safetensors
 from transformers import (
     AutoModelForImageTextToText,
     AutoTokenizer,
@@ -314,26 +316,159 @@ class SampleGenerationCallback(TrainerCallback):
 # Post-training: merge + inference
 # ---------------------------------------------------------------------------
 
-def merge_adapter(model_id: str, adapter_dir: str, output_dir: str):
-    """Load the base model at full precision, merge the trained LoRA adapter,
-    and save the combined weights.
+def _adapter_config_override(adapter_path: str) -> LoraConfig:
+    """Build a LoraConfig with target_modules="all-linear" from a saved adapter.
 
-    Note: QLoRA adapters were trained on 4-bit quantised weights.  Merging
-    into full-precision weights introduces a quantisation-error mismatch that
-    can degrade output quality.  Prefer adapter-based inference when possible.
+    PeftModel.from_pretrained uses the *resolved* target_modules list persisted
+    in adapter_config.json.  For Gemma4ForConditionalGeneration this list
+    contains a mix of path formats (e.g. "language_model.layers.0.self_attn.q_proj"
+    alongside "32.mlp.gate_proj") that fail PEFT's endswith-matching, leaving
+    LoRA parameters as orphan tensors disconnected from the forward graph.
+
+    Passing target_modules="all-linear" forces PEFT to re-discover linear
+    modules at load time — the same strategy used during training — which
+    correctly injects LoRA wrappers.
     """
+    with open(os.path.join(adapter_path, "adapter_config.json")) as f:
+        cfg = json.load(f)
+    return LoraConfig(
+        r=cfg["r"],
+        lora_alpha=cfg["lora_alpha"],
+        lora_dropout=0.0,
+        target_modules="all-linear",
+        task_type=cfg.get("task_type", "CAUSAL_LM"),
+        bias=cfg.get("bias", "none"),
+    )
+
+
+def _replace_submodule(root: torch.nn.Module, dotted_name: str, new: torch.nn.Module):
+    """Replace a nested submodule by its dotted path."""
+    parts = dotted_name.split(".")
+    parent = root
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    setattr(parent, parts[-1], new)
+
+
+def _dequant_linear(module) -> torch.nn.Linear:
+    """Dequantize a bnb Linear4bit into a regular nn.Linear (bfloat16)."""
+    import bitsandbytes as bnb
+
+    w = bnb.functional.dequantize_4bit(
+        module.weight.data, module.weight.quant_state,
+    ).to(torch.bfloat16)
+    out = torch.nn.Linear(
+        w.shape[1], w.shape[0],
+        bias=module.bias is not None,
+        device=w.device, dtype=w.dtype,
+    )
+    out.weight = torch.nn.Parameter(w)
+    if module.bias is not None:
+        out.bias = torch.nn.Parameter(module.bias.data.to(w.dtype))
+    return out
+
+
+def merge_adapter(model_id: str, adapter_dir: str, output_dir: str):
+    """Merge a QLoRA adapter into the base model and save at full precision.
+
+    The base model is loaded with the SAME 4-bit quantisation used during
+    training so that ``dequant(W_4bit) + LoRA`` reproduces the training-time
+    forward pass exactly.
+
+    We bypass PEFT's ``merge_and_unload()`` because it re-quantises the merged
+    weights back to 4-bit (destroying precision).  Instead we manually
+    dequantise each base weight, add the LoRA delta in float, and store the
+    result as a regular ``nn.Linear``.
+    """
+    import bitsandbytes as bnb
+
     print(f"\nMerging adapter into base model...")
     print(f"  Base model : {model_id}")
     print(f"  Adapter    : {adapter_dir}")
     print(f"  Output     : {output_dir}")
 
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        compute_dtype = torch.bfloat16
+    else:
+        compute_dtype = torch.float16
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_quant_storage=compute_dtype,
+    )
+
     base = AutoModelForImageTextToText.from_pretrained(
         model_id,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.bfloat16,
+        quantization_config=bnb_config,
+        device_map={"": 0},
+        dtype=compute_dtype,
     )
-    peft_model = PeftModel.from_pretrained(base, adapter_dir)
-    merged = peft_model.merge_and_unload()
+
+    cfg = _adapter_config_override(adapter_dir)
+    peft_model = get_peft_model(base, cfg)
+
+    weights_file = os.path.join(adapter_dir, "adapter_model.safetensors")
+    if os.path.exists(weights_file):
+        adapter_weights = load_safetensors(weights_file)
+    else:
+        adapter_weights = torch.load(
+            os.path.join(adapter_dir, "adapter_model.bin"),
+            map_location="cpu", weights_only=True,
+        )
+    set_peft_model_state_dict(peft_model, adapter_weights)
+
+    # ---- Manual merge (avoids re-quantisation) ------------------------------
+    lora_model = peft_model.base_model          # LoraModel wrapper
+    print("  Merging LoRA weights (manual dequant, no re-quantisation)...")
+
+    # Pass 1: merge each LoRA-wrapped module → float nn.Linear
+    for name, module in list(lora_model.named_modules()):
+        if not (hasattr(module, "get_base_layer") and hasattr(module, "lora_A")):
+            continue
+        if not module.lora_A:
+            continue
+
+        base_layer = module.get_base_layer()
+
+        if hasattr(base_layer.weight, "quant_state"):
+            w = bnb.functional.dequantize_4bit(
+                base_layer.weight.data, base_layer.weight.quant_state,
+            )
+        else:
+            w = base_layer.weight.data.clone()
+        w = w.to(torch.bfloat16)
+
+        for adapter_name in module.active_adapters:
+            if adapter_name in module.lora_A:
+                delta = module.get_delta_weight(adapter_name)
+                w = w + delta.to(w.dtype)
+
+        new_linear = torch.nn.Linear(
+            w.shape[1], w.shape[0],
+            bias=base_layer.bias is not None,
+            device=w.device, dtype=w.dtype,
+        )
+        new_linear.weight = torch.nn.Parameter(w)
+        if base_layer.bias is not None:
+            new_linear.bias = torch.nn.Parameter(
+                base_layer.bias.data.to(w.dtype),
+            )
+        _replace_submodule(lora_model, name, new_linear)
+
+    merged = lora_model.model  # unwrap → Gemma4ForConditionalGeneration
+
+    # Pass 2: dequantize remaining (non-LoRA) Linear4bit modules
+    for name, module in list(merged.named_modules()):
+        if isinstance(module, bnb.nn.Linear4bit):
+            _replace_submodule(merged, name, _dequant_linear(module))
+
+    # Remove quantization metadata so the saved model loads as plain bfloat16
+    for attr in ("quantization_config", "hf_quantizer", "_pre_quantization_dtype"):
+        merged.__dict__.pop(attr, None)
+        merged.config.__dict__.pop(attr, None)
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -345,8 +480,36 @@ def merge_adapter(model_id: str, adapter_dir: str, output_dir: str):
     return out
 
 
+def _check_lora_weights(model, label=""):
+    """Print norms of a few LoRA parameters to verify they are loaded."""
+    lora_norms = []
+    for name, param in model.named_parameters():
+        if "lora_" in name and param.numel() > 0:
+            lora_norms.append((name, param.data.norm().item()))
+            if len(lora_norms) >= 4:
+                break
+
+    if not lora_norms:
+        print(f"  {label}WARNING: No LoRA parameters found!")
+        return
+
+    total = sum(1 for n, _ in model.named_parameters() if "lora_" in n)
+    nonzero = sum(1 for n, p in model.named_parameters()
+                  if "lora_" in n and p.data.norm().item() > 1e-8)
+    print(f"  {label}LoRA params: {total} total, {nonzero} with non-zero norm")
+    for name, norm in lora_norms:
+        short = name.split(".")[-3:]
+        print(f"    {'·'.join(short):40s} norm={norm:.6f}")
+
+
 def load_adapter_for_inference(base_model_id: str, adapter_path: str):
-    """Reload the quantised base model + LoRA adapter for inference."""
+    """Reload the quantised base model + LoRA adapter for inference.
+
+    Uses get_peft_model() + manual weight loading instead of
+    PeftModel.from_pretrained() to work around a PEFT bug where the resolved
+    target_modules list in adapter_config.json fails to inject LoRA wrappers
+    into Gemma4ForConditionalGeneration.
+    """
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
         compute_dtype = torch.bfloat16
     else:
@@ -367,10 +530,59 @@ def load_adapter_for_inference(base_model_id: str, adapter_path: str):
         device_map={"": 0},
         dtype=compute_dtype,
     )
-    print(f"  Loading adapter: {adapter_path}")
-    model = PeftModel.from_pretrained(base, adapter_path)
+
+    # Build LoRA config from saved adapter, using dynamic target resolution
+    cfg = _adapter_config_override(adapter_path)
+    print(f"  Injecting LoRA via get_peft_model (target_modules='all-linear')...")
+    model = get_peft_model(base, cfg)
+
+    # Load saved adapter weights
+    weights_file = os.path.join(adapter_path, "adapter_model.safetensors")
+    if not os.path.exists(weights_file):
+        weights_file = os.path.join(adapter_path, "adapter_model.bin")
+        adapter_weights = torch.load(weights_file, map_location="cpu", weights_only=True)
+    else:
+        adapter_weights = load_safetensors(weights_file)
+
+    set_peft_model_state_dict(model, adapter_weights)
     model.eval()
+    _check_lora_weights(model, label="After manual load: ")
+
     tokenizer = AutoTokenizer.from_pretrained(adapter_path)
+
+    # Quick adapter ON/OFF sanity check
+    test_ids = torch.tensor(
+        [[2, 105, 2364, 107, 10979, 106, 107, 105, 4368, 107]],
+        device=next(model.parameters()).device,
+    )
+    with torch.no_grad():
+        out = model(
+            input_ids=test_ids,
+            attention_mask=torch.ones_like(test_ids),
+            token_type_ids=torch.zeros_like(test_ids),
+            mm_token_type_ids=torch.zeros_like(test_ids),
+        )
+        on_id = out.logits[0, -1].argmax().item()
+
+        with model.disable_adapter():
+            out_off = model(
+                input_ids=test_ids,
+                attention_mask=torch.ones_like(test_ids),
+                token_type_ids=torch.zeros_like(test_ids),
+                mm_token_type_ids=torch.zeros_like(test_ids),
+            )
+            off_id = out_off.logits[0, -1].argmax().item()
+
+    print(f"  Adapter ON:  {tokenizer.decode([on_id])!r}  (id={on_id})")
+    print(f"  Adapter OFF: {tokenizer.decode([off_id])!r}  (id={off_id})")
+    if on_id == off_id:
+        print("  WARNING: adapter ON/OFF identical — LoRA not affecting forward!")
+        for name, mod in model.named_modules():
+            if "q_proj" in name and "language_model" in name and "layers.0" in name:
+                print(f"    {name}: {type(mod).__module__}.{type(mod).__qualname__}")
+                print(f"    has lora_A: {hasattr(mod, 'lora_A')}")
+                break
+
     return model, tokenizer
 
 
@@ -445,7 +657,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="CUDA device index to train on (single-GPU QLoRA)")
     g.add_argument("--output", default="train/output/gemma-finetune")
     g.add_argument("--epochs", type=int, default=1)
-    g.add_argument("--batch-size", type=int, default=1)
+    g.add_argument("--batch-size", type=int, default=4)
     g.add_argument("--gradient-accumulation-steps", type=int, default=1)
     g.add_argument("--learning-rate", type=float, default=5e-5)
     g.add_argument("--max-length", type=int, default=512)
@@ -565,6 +777,8 @@ def main(argv: list[str] | None = None):
 
     # ---- 6. In-memory smoke test (no save/load) ---------------------------
     if args.test_inference:
+        _check_lora_weights(trainer.model, label="In-memory after training: ")
+
         print("\n" + "=" * 60)
         print("  IN-MEMORY test (trainer model, no save/load cycle)")
         print("=" * 60)

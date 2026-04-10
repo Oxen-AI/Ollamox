@@ -1,4 +1,8 @@
-# From Fine-Tuned LoRA Weights to a Local Ollama Model
+# 🐂 x 🦙
+
+What happens when an Ox meets a Llama? You own your AI end to end.
+
+## Converting Fine-Tuned LoRA Weights to a Local Ollama Model
 
 Open weights models have many advantages over closed APIs. You can run them on your own hardware, fine-tune them on your own data, and ship them without depending on someone else's infrastructure. 
 
